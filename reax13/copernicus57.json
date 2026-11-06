@@ -1,0 +1,8 @@
+{
+  "model_root": "/model",
+  "precision": "fp8",
+  "devices": ["cuda:0", "cuda:0"],
+  "startup_timeout": 1800,
+  "request_timeout": 1800,
+  "max_input_proxy_tokens": 32000
+}

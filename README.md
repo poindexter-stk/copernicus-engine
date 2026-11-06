@@ -1,3 +1,5 @@
+> **Copernicus-57B:** For the single-GPU FP8 runtime and installation, see [README_COPERNICUS.md](README_COPERNICUS.md). The original REAX Engine documentation follows.
+
 # REAX Engine
 
 An **inference engine for decision models**. Open source under the MIT License (see [Licence](#licence)).
