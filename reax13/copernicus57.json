@@ -4,5 +4,8 @@
   "devices": ["cuda:0", "cuda:0"],
   "startup_timeout": 1800,
   "request_timeout": 1800,
-  "max_input_proxy_tokens": 32000
+  "max_input_proxy_tokens": 40000,
+  "concurrent_proxy_limit": 16000,
+  "qwen_batch_size": 8,
+  "qwen_batch_tokens": 4096
 }

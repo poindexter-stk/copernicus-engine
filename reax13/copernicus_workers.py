@@ -32,6 +32,7 @@ def load_gemma(model_dir, device, precision):
     if precision == 'fp8' and not any('float8' in str(p.dtype) for p in model.parameters()):
         raise RuntimeError('Gemma weights were not quantized to FP8')
 
+    execution_stream = None
     class Backend:
         def warm(self, *args):
             pass
@@ -42,22 +43,29 @@ def load_gemma(model_dir, device, precision):
             token_ids = tokenizer.encode(text, add_special_tokens=False)
             if len(token_ids) > 32768:
                 raise InputLimitError('Gemma rendered prompt exceeds 32768 tokens')
-            inputs = torch.tensor([token_ids], device=device)
-            with torch.inference_mode():
+            # KnowLine executes multi-question scoring in its own thread pool;
+            # CUDA's current stream is thread-local, so propagate the request stream.
+            with torch.cuda.stream(execution_stream), torch.inference_mode():
+                inputs = torch.tensor([token_ids], device=device)
                 logits = model(input_ids=inputs, logits_to_keep=1, use_cache=False).logits[0, -1].float().log_softmax(-1)
-            return [float(logits[i]) for i in ids], int(inputs.shape[1])
+                return [float(logits[i]) for i in ids], int(inputs.shape[1])
 
     temperatures = Path(model_dir)/'temperatures.json'
     if not temperatures.exists():
         temperatures = root/'third_party'/'knowline'/'temperatures.json'
     runner = ks.KnowLine(tokenizer, Backend(), 1.0, 1, json.loads(temperatures.read_text()), Layout(read_twice=True, twice_max_tokens=3000))
     def decide(state, questions):
-        answers, _ = runner.run(state, questions)
-        return {'answers': answers}
+        nonlocal execution_stream
+        execution_stream=torch.cuda.current_stream(device=device)
+        try:
+            answers, _ = runner.run(state, questions)
+            return {'answers': answers}
+        finally:
+            execution_stream=None
     return decide
 
 
-def load_qwen(model_dir, device, precision):
+def load_qwen(model_dir, device, precision, batch_size=8, batch_tokens=4096):
     from reax_subnet.spec import prompt as P
     from reax_subnet.spec.joint import JointRunner
     codes = json.loads((Path(model_dir)/'decision_config.json').read_text())['codes']
@@ -95,10 +103,11 @@ def load_qwen(model_dir, device, precision):
     if precision == 'fp8' and not any('float8' in str(p.dtype) for p in runner.model.parameters()):
         raise RuntimeError('Qwen weights were not quantized to FP8')
     runner.max_length = 32768
-    runner.batch_size = 1
+    if batch_size < 1 or batch_tokens < 1:
+        raise ValueError('Qwen batch limits must be positive')
     def decide(state, questions):
         import torch
-        answers = {}
+        answers = {}; plans=[]
         for qid, question in questions.items():
             row = {'state':state, 'question':question}
             rendered = P.render(state, question)
@@ -108,19 +117,28 @@ def load_qwen(model_dir, device, precision):
             ids = runner.tokenizer.encode(text, add_special_tokens=False)
             if not ids or len(ids) > runner.max_length:
                 raise InputLimitError('Qwen rendered prompt exceeds 32768 tokens or is empty')
-            input_ids = torch.tensor([ids], device=runner.weight.device)
+            plans.append((len(ids), qid, row, rendered, ids))
+        plans.sort(key=lambda plan: plan[0])
+        while plans:
+            length=plans[0][0]
+            limit=min(batch_size,max(1,batch_tokens//length))
+            group=[]
+            while plans and plans[0][0]==length and len(group)<limit:
+                group.append(plans.pop(0))
+            input_ids = torch.tensor([plan[4] for plan in group], device=runner.weight.device)
             with torch.inference_mode():
                 hidden = runner.model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), use_cache=False).last_hidden_state
-                logits = torch.nn.functional.linear(hidden[:, -1], runner.weight).float().cpu().tolist()[0]
-            values = logits[:len(rendered.letters)]
-            if not all(math.isfinite(v) for v in values):
-                raise ValueError(f'Qwen returned non-finite logits for {qid!r}')
-            dist = P.answer_probs(row, rendered, values)
-            kind = question['type']
-            if kind == 'noul':
-                answers[qid] = {'type':kind, 'noul':dist['yes']}
-            else:
-                answers[qid] = {'type':kind, 'probabilities':dist}
+                logits = torch.nn.functional.linear(hidden[:, -1], runner.weight).float().cpu().tolist()
+            for (_, qid, row, rendered, _), values in zip(group, logits):
+                values = values[:len(rendered.letters)]
+                if not all(math.isfinite(v) for v in values):
+                    raise ValueError(f'Qwen returned non-finite logits for {qid!r}')
+                dist = P.answer_probs(row, rendered, values)
+                kind = row['question']['type']
+                if kind == 'noul':
+                    answers[qid] = {'type':kind, 'noul':dist['yes']}
+                else:
+                    answers[qid] = {'type':kind, 'probabilities':dist}
         return {'answers':answers}
     return decide
 
