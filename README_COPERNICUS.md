@@ -2,7 +2,9 @@
 
 This fork adds a Copernicus-57B runtime to the `reax13/` directory, based on REAX Engine commit `ff8f595f149abdd50ea914455eadc74cf97a277f`. The original REAX code remains available in this checkout; upstream copyright, licences and notices remain in place.
 
-The model is distributed as `Poindexter-Labs/Copernicus-57B` with two complete directories: `part-g/` (Copernicus-G) and `part-q/` (Copernicus-Q). The runtime invokes both model-specific readouts concurrently and uses the original `reax13/probabilities.py` mixer to average their probabilities equally. It supports text-only `choice`, `noul` and `score` requests. Request option identities are preserved and checked.
+The model is distributed as `Poindexter-Labs/Copernicus-57B` with two complete directories: `part-g/` (Copernicus-G) and `part-q/` (Copernicus-Q). The runtime invokes both model-specific readouts sequentially and uses the original `reax13/probabilities.py` mixer to average their probabilities equally. It supports text-only `choice`, `noul` and `score` requests. Request option identities are preserved and checked.
+
+External requests are processed one at a time. Within each model, questions are also scored individually without batching. Rendered prompts over 32,768 tokens per model are refused as unsupported; they are never truncated.
 
 ## Runtime
 

@@ -7,6 +7,10 @@ import traceback
 from pathlib import Path
 
 
+class InputLimitError(ValueError):
+    """The rendered prompt exceeds the explicitly declared per-model token limit."""
+
+
 FP8_EXCLUDE = ['lm_head','visual','model.visual','vision_tower','model.vision_tower','multi_modal_projector','model.multi_modal_projector','audio_tower','model.audio_tower','embed_vision','embed_audio','in_proj_a','in_proj_b']
 
 
@@ -35,7 +39,10 @@ def load_gemma(model_dir, device, precision):
         def score(self, text, media, ids):
             if media:
                 raise ValueError('Only text inputs are supported')
-            inputs = torch.tensor([tokenizer.encode(text, add_special_tokens=False)], device=device)
+            token_ids = tokenizer.encode(text, add_special_tokens=False)
+            if len(token_ids) > 32768:
+                raise InputLimitError('Gemma rendered prompt exceeds 32768 tokens')
+            inputs = torch.tensor([token_ids], device=device)
             with torch.inference_mode():
                 logits = model(input_ids=inputs, logits_to_keep=1, use_cache=False).logits[0, -1].float().log_softmax(-1)
             return [float(logits[i]) for i in ids], int(inputs.shape[1])
@@ -88,13 +95,27 @@ def load_qwen(model_dir, device, precision):
     if precision == 'fp8' and not any('float8' in str(p.dtype) for p in runner.model.parameters()):
         raise RuntimeError('Qwen weights were not quantized to FP8')
     runner.max_length = 32768
+    runner.batch_size = 1
     def decide(state, questions):
-        pairs = list(questions.items())
-        probs = runner.decide([{'state':state, 'question':q} for _, q in pairs])
+        import torch
         answers = {}
-        for (qid, question), dist in zip(pairs, probs):
-            if dist is None:
-                raise ValueError(f'Qwen could not score question {qid!r} (including context or GPU errors)')
+        for qid, question in questions.items():
+            row = {'state':state, 'question':question}
+            rendered = P.render(state, question)
+            text = runner.tokenizer.apply_chat_template(
+                [{'role':'system','content':rendered.system}, {'role':'user','content':rendered.user}],
+                tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            ids = runner.tokenizer.encode(text, add_special_tokens=False)
+            if not ids or len(ids) > runner.max_length:
+                raise InputLimitError('Qwen rendered prompt exceeds 32768 tokens or is empty')
+            input_ids = torch.tensor([ids], device=runner.weight.device)
+            with torch.inference_mode():
+                hidden = runner.model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), use_cache=False).last_hidden_state
+                logits = torch.nn.functional.linear(hidden[:, -1], runner.weight).float().cpu().tolist()[0]
+            values = logits[:len(rendered.letters)]
+            if not all(math.isfinite(v) for v in values):
+                raise ValueError(f'Qwen returned non-finite logits for {qid!r}')
+            dist = P.answer_probs(row, rendered, values)
             kind = question['type']
             if kind == 'noul':
                 answers[qid] = {'type':kind, 'noul':dist['yes']}
@@ -112,7 +133,7 @@ def worker(conn, kind, model_dir, device, precision='bf16'):
             import fast_fp8_gemm
             fast_fp8_gemm.install()
         decide = (load_gemma if kind == 'g' else load_qwen)(model_dir, device, precision)
-        conn.send({'status':'ready', 'allocated_bytes':torch.cuda.memory_allocated(), 'reserved_bytes':torch.cuda.memory_reserved()})
+        conn.send({'status':'ready', 'gpu':torch.cuda.get_device_name(device), 'torch':torch.__version__, 'allocated_bytes':torch.cuda.memory_allocated(device), 'reserved_bytes':torch.cuda.memory_reserved(device)})
         while True:
             request = conn.recv()
             if request is None:
@@ -120,7 +141,7 @@ def worker(conn, kind, model_dir, device, precision='bf16'):
             try:
                 conn.send({'status':'ok', 'response':decide(request['state'], request['questions'])})
             except Exception as exc:
-                conn.send({'status':'error', 'error':f'{type(exc).__name__}: {exc}'})
+                conn.send({'status':'error', 'exception':type(exc).__name__, 'error':f'{type(exc).__name__}: {exc}'})
     except BaseException as exc:
         try:
             conn.send({'status':'fatal', 'error':f'{type(exc).__name__}: {exc}', 'traceback':traceback.format_exc()})
